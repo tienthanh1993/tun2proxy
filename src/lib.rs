@@ -225,11 +225,12 @@ where
     let socket_queue = None;
 
     use socks5_impl::protocol::Version::{V4, V5};
+    let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
     let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
         ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)),
         ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)),
         ProxyType::Http => Arc::new(HttpManager::new(server_addr, key)),
-        ProxyType::None => Arc::new(NoProxyManager::new()),
+        ProxyType::None => no_proxy_mgr.clone(),
     };
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
@@ -294,11 +295,37 @@ where
                 } else {
                     None
                 };
-                let proxy_handler = mgr.new_proxy_handler(info, domain_name, false).await?;
+
+                let mgr = mgr.clone();
+                let no_proxy_mgr = no_proxy_mgr.clone();
                 let socket_queue = socket_queue.clone();
+                let task_count = task_count.clone();
+
                 tokio::spawn(async move {
-                    if let Err(err) = handle_tcp_session(tcp, proxy_handler, socket_queue).await {
-                        log::error!("{info} error \"{err}\"");
+                    let mut info = info;
+                    let mut use_no_proxy = false;
+                    if let Some(domain) = &domain_name {
+                        if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port()).await {
+                            use_no_proxy = true;
+                            info.dst = addr;
+                        }
+                    }
+
+                    let proxy_handler_res = if use_no_proxy {
+                        no_proxy_mgr.new_proxy_handler(info, domain_name, false).await
+                    } else {
+                        mgr.new_proxy_handler(info, domain_name, false).await
+                    };
+
+                    match proxy_handler_res {
+                        Ok(proxy_handler) => {
+                            if let Err(err) = handle_tcp_session(tcp, proxy_handler, socket_queue).await {
+                                log::error!("{info} error \"{err}\"");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to create proxy handler: {e}");
+                        }
                     }
                     log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
                 });
@@ -350,43 +377,68 @@ where
                 } else {
                     None
                 };
+
                 #[cfg(feature = "udpgw")]
-                if let Some(udpgw) = udpgw_client.clone() {
-                    let tcp_src = match udp.peer_addr() {
-                        SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-                        SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
-                    };
-                    let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
-                    let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
-                    let queue = socket_queue.clone();
-                    tokio::spawn(async move {
-                        let dst = info.dst; // real UDP destination address
-                        let dst_addr = match domain_name {
-                            Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
-                            None => dst.into(),
-                        };
-                        if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled).await {
-                            log::info!("Ending {info} with \"{e}\"");
+                let udpgw_client = udpgw_client.clone();
+                let mgr = mgr.clone();
+                let no_proxy_mgr = no_proxy_mgr.clone();
+                let socket_queue = socket_queue.clone();
+                let task_count = task_count.clone();
+                let proxy_type = args.proxy.proxy_type;
+
+                tokio::spawn(async move {
+                    let mut info = info;
+                    let mut use_no_proxy = false;
+                    if let Some(domain) = &domain_name {
+                        if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port()).await {
+                            use_no_proxy = true;
+                            info.dst = addr;
                         }
-                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
-                    });
-                    continue;
-                }
-                match mgr.new_proxy_handler(info, domain_name, true).await {
-                    Ok(proxy_handler) => {
-                        let socket_queue = socket_queue.clone();
-                        tokio::spawn(async move {
-                            let ty = args.proxy.proxy_type;
-                            if let Err(err) = handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled).await {
-                                log::info!("Ending {info} with \"{err}\"");
+                    }
+
+                    #[cfg(feature = "udpgw")]
+                    if !use_no_proxy {
+                        if let Some(udpgw) = udpgw_client {
+                            let tcp_src = match udp.peer_addr() {
+                                SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                                SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+                            };
+                            let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
+                            match mgr.new_proxy_handler(tcpinfo, None, false).await {
+                                Ok(proxy_handler) => {
+                                    let dst = info.dst; // real UDP destination address
+                                    let dst_addr = match domain_name {
+                                        Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
+                                        None => dst.into(),
+                                    };
+                                    if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, socket_queue, ipv6_enabled).await {
+                                        log::info!("Ending {info} with \"{e}\"");
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to create proxy handler for UDPGW: {e}");
+                                }
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
-                        });
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        log::error!("Failed to create UDP connection: {e}");
+
+                    let proxy_mgr = if use_no_proxy { &no_proxy_mgr } else { &mgr };
+                    let proxy_type = if use_no_proxy { ProxyType::None } else { proxy_type };
+
+                    match proxy_mgr.new_proxy_handler(info, domain_name, true).await {
+                        Ok(proxy_handler) => {
+                            if let Err(err) = handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled).await {
+                                log::info!("Ending {info} with \"{err}\"");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to create UDP connection: {e}");
+                        }
                     }
-                }
+                    log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                });
             }
             IpStackStream::UnknownTransport(u) => {
                 let len = u.payload().len();
@@ -854,4 +906,12 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
     }
     crate::traffic_status::traffic_status_update(tx, rx)?;
     Ok(proxy_handler.get_udp_associate())
+}
+
+async fn resolve_domain_to_private_ip(domain: &str, port: u16) -> Option<SocketAddr> {
+    if let Ok(mut addrs) = tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
+        addrs.find(|a| is_private_ip(a.ip()))
+    } else {
+        None
+    }
 }
