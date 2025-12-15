@@ -1,11 +1,37 @@
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
+    op::Query,
     rr::{
-        Name, RData, Record,
+        Name, RData, Record, RecordType,
         rdata::{A, AAAA},
     },
 };
 use std::{net::IpAddr, str::FromStr};
+
+pub fn build_dns_query(domain: &str) -> Result<Vec<u8>, String> {
+    let mut msg = Message::new();
+    let query = Query::query(Name::from_str(domain)?, RecordType::A);
+    msg.add_query(query);
+    msg.set_recursion_desired(true);
+    msg.to_vec().map_err(|e| e.to_string())
+}
+
+pub fn extract_private_ip_from_dns_message(message: &Message) -> Option<IpAddr> {
+    if message.response_code() != ResponseCode::NoError {
+        return None;
+    }
+    for answer in message.answers() {
+        let ip = match answer.data() {
+            RData::A(addr) => IpAddr::V4((*addr).into()),
+            RData::AAAA(addr) => IpAddr::V6((*addr).into()),
+            _ => continue,
+        };
+        if tproxy_config::is_private_ip(ip) {
+            return Some(ip);
+        }
+    }
+    None
+}
 
 pub fn build_dns_response(mut request: Message, domain: &str, ip: IpAddr, ttl: u32) -> Result<Message, String> {
     let record = match ip {
