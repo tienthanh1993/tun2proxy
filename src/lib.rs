@@ -225,12 +225,11 @@ where
     let socket_queue = None;
 
     use socks5_impl::protocol::Version::{V4, V5};
-    let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
     let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
         ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)),
         ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)),
         ProxyType::Http => Arc::new(HttpManager::new(server_addr, key)),
-        ProxyType::None => no_proxy_mgr.clone(),
+        ProxyType::None => Arc::new(NoProxyManager::new()),
     };
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
@@ -297,27 +296,20 @@ where
                 };
 
                 let mgr = mgr.clone();
-                let no_proxy_mgr = no_proxy_mgr.clone();
                 let socket_queue = socket_queue.clone();
                 let task_count = task_count.clone();
 
                 tokio::spawn(async move {
                     let mut info = info;
-                    let mut use_no_proxy = false;
+                    let mut domain_name = domain_name;
                     if let Some(domain) = &domain_name {
                         if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port()).await {
-                            use_no_proxy = true;
                             info.dst = addr;
+                            domain_name = None;
                         }
                     }
 
-                    let proxy_handler_res = if use_no_proxy {
-                        no_proxy_mgr.new_proxy_handler(info, domain_name, false).await
-                    } else {
-                        mgr.new_proxy_handler(info, domain_name, false).await
-                    };
-
-                    match proxy_handler_res {
+                    match mgr.new_proxy_handler(info, domain_name, false).await {
                         Ok(proxy_handler) => {
                             if let Err(err) = handle_tcp_session(tcp, proxy_handler, socket_queue).await {
                                 log::error!("{info} error \"{err}\"");
@@ -381,23 +373,22 @@ where
                 #[cfg(feature = "udpgw")]
                 let udpgw_client = udpgw_client.clone();
                 let mgr = mgr.clone();
-                let no_proxy_mgr = no_proxy_mgr.clone();
                 let socket_queue = socket_queue.clone();
                 let task_count = task_count.clone();
                 let proxy_type = args.proxy.proxy_type;
 
                 tokio::spawn(async move {
                     let mut info = info;
-                    let mut use_no_proxy = false;
+                    let mut domain_name = domain_name;
                     if let Some(domain) = &domain_name {
                         if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port()).await {
-                            use_no_proxy = true;
                             info.dst = addr;
+                            domain_name = None;
                         }
                     }
 
                     #[cfg(feature = "udpgw")]
-                    if !use_no_proxy {
+                    if domain_name.is_some() {
                         if let Some(udpgw) = udpgw_client {
                             let tcp_src = match udp.peer_addr() {
                                 SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
@@ -424,10 +415,7 @@ where
                         }
                     }
 
-                    let proxy_mgr = if use_no_proxy { &no_proxy_mgr } else { &mgr };
-                    let proxy_type = if use_no_proxy { ProxyType::None } else { proxy_type };
-
-                    match proxy_mgr.new_proxy_handler(info, domain_name, true).await {
+                    match mgr.new_proxy_handler(info, domain_name, true).await {
                         Ok(proxy_handler) => {
                             if let Err(err) = handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled).await {
                                 log::info!("Ending {info} with \"{err}\"");
