@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAPPING_TIMEOUT: u64 = 300; // Mapping timeout in seconds
+const MAPPING_TIMEOUT: u64 = 120; // Mapping timeout in seconds
 
 struct CacheEntry {
     name: String,
@@ -18,7 +18,7 @@ pub struct DnsCache {
 impl DnsCache {
     pub fn new() -> Self {
         Self {
-            lru_cache: LruCache::new(5000),
+            lru_cache: LruCache::new_unbounded(),
         }
     }
 
