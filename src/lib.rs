@@ -50,6 +50,7 @@ mod android;
 mod args;
 mod directions;
 mod dns;
+mod dns_cache;
 mod dump_logger;
 mod error;
 mod general_api;
@@ -350,7 +351,7 @@ where
                         let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
                         let socket_queue = socket_queue.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled).await {
+                            if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
                                 log::error!("{info} error \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -429,7 +430,7 @@ where
 
                     match proxy_mgr.new_proxy_handler(info, domain_name, true).await {
                         Ok(proxy_handler) => {
-                            if let Err(err) = handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled).await {
+                            if let Err(err) = handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
                                 log::info!("Ending {info} with \"{err}\"");
                             }
                         }
@@ -550,6 +551,7 @@ async fn handle_udp_gateway_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_cache: Arc<Mutex<crate::dns_cache::DnsCache>>,
 ) -> crate::Result<()> {
     let proxy_server_addr = { proxy_handler.lock().await.get_server_addr() };
     let udp_mtu = udpgw_client.get_udp_mtu();
@@ -670,6 +672,7 @@ async fn handle_udp_associate_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_cache: Arc<Mutex<crate::dns_cache::DnsCache>>,
 ) -> crate::Result<()> {
     use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
 
@@ -770,6 +773,7 @@ async fn handle_dns_over_tcp_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_cache: Arc<Mutex<crate::dns_cache::DnsCache>>,
 ) -> crate::Result<()> {
     let (session_info, server_addr) = {
         let handler = proxy_handler.lock().await;
@@ -830,9 +834,21 @@ async fn handle_dns_over_tcp_session(
 
                     let mut message = dns::parse_data_to_dns_message(&data, false)?;
 
-                    let name = dns::extract_domain_from_dns_message(&message)?;
-                    let ip = dns::extract_ipaddr_from_dns_message(&message);
-                    log::trace!("DNS over TCP query result: {name} -> {ip:?}");
+                    match dns::extract_domain_from_dns_message(&message) {
+                        Ok(name) => {
+                            let ips = dns::extract_ipaddrs_from_dns_message(&message);
+                            log::trace!("DNS over TCP query result: {name} -> {ips:?}");
+                            if let Ok(ips) = ips {
+                                let mut dns_cache = dns_cache.lock().await;
+                                for ip in ips {
+                                    dns_cache.insert(ip, name.clone());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("Failed to extract domain from DNS message: {}", e);
+                        }
+                    }
 
                     if !ipv6_enabled {
                         dns::remove_ipv6_entries(&mut message);
