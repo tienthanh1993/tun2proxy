@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAPPING_TIMEOUT: u64 = 60; // Mapping timeout in seconds
+const MAPPING_TIMEOUT: u64 = 300; // Mapping timeout in seconds
 
 struct CacheEntry {
     name: String,

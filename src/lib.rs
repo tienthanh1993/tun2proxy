@@ -174,7 +174,6 @@ where
     } else {
         None
     };
-    let dns_cache = Arc::new(Mutex::new(crate::dns_cache::DnsCache::new()));
 
     #[cfg(target_os = "linux")]
     let socket_queue = match args.socket_transfer_fd {
@@ -295,8 +294,7 @@ where
                     virtual_dns.touch_ip(&tcp.peer_addr().ip());
                     virtual_dns.resolve_ip(&tcp.peer_addr().ip()).cloned()
                 } else {
-                    let mut dns_cache = dns_cache.lock().await;
-                    dns_cache.lookup(&tcp.peer_addr().ip())
+                    None
                 };
 
                 let mgr = mgr.clone();
@@ -352,7 +350,6 @@ where
                         info.protocol = IpProtocol::Tcp;
                         let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
                         let socket_queue = socket_queue.clone();
-                        let dns_cache = dns_cache.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
                                 log::error!("{info} error \"{err}\"");
@@ -379,8 +376,7 @@ where
                     virtual_dns.touch_ip(&udp.peer_addr().ip());
                     virtual_dns.resolve_ip(&udp.peer_addr().ip()).cloned()
                 } else {
-                    let mut dns_cache = dns_cache.lock().await;
-                    dns_cache.lookup(&udp.peer_addr().ip())
+                    None
                 };
 
                 #[cfg(feature = "udpgw")]
@@ -434,7 +430,7 @@ where
 
                     match proxy_mgr.new_proxy_handler(info, domain_name, true).await {
                         Ok(proxy_handler) => {
-                            if let Err(err) = handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled).await {
+                            if let Err(err) = handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
                                 log::info!("Ending {info} with \"{err}\"");
                             }
                         }
@@ -555,6 +551,7 @@ async fn handle_udp_gateway_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_cache: Arc<Mutex<crate::dns_cache::DnsCache>>,
 ) -> crate::Result<()> {
     let proxy_server_addr = { proxy_handler.lock().await.get_server_addr() };
     let udp_mtu = udpgw_client.get_udp_mtu();
@@ -675,6 +672,7 @@ async fn handle_udp_associate_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_cache: Arc<Mutex<crate::dns_cache::DnsCache>>,
 ) -> crate::Result<()> {
     use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
 
@@ -834,43 +832,29 @@ async fn handle_dns_over_tcp_session(
                     // remove the length field
                     let data = buf[2..len + 2].to_vec();
 
-                    match dns::parse_data_to_dns_message(&data, false) {
-                        Ok(mut message) => {
-                            match dns::extract_domain_from_dns_message(&message) {
-                                Ok(name) => {
-                                    let ips = dns::extract_ipaddrs_from_dns_message(&message);
-                                    log::trace!("DNS over TCP query result: {name} -> {ips:?}");
-                                    if let Ok(ips) = ips {
-                                        let mut dns_cache = dns_cache.lock().await;
-                                        for ip in ips {
-                                            dns_cache.insert(ip, name.clone());
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log::debug!("Failed to extract domain from DNS message: {}", e);
-                                }
-                            }
+                    let mut message = dns::parse_data_to_dns_message(&data, false)?;
 
-                            if !ipv6_enabled {
-                                dns::remove_ipv6_entries(&mut message);
-                                match message.to_vec() {
-                                    Ok(v) => to_send.push_back(v),
-                                    Err(e) => {
-                                        log::warn!("Failed to serialize DNS message: {}", e);
-                                        to_send.push_back(data);
-                                    }
+                    match dns::extract_domain_from_dns_message(&message) {
+                        Ok(name) => {
+                            let ips = dns::extract_ipaddrs_from_dns_message(&message);
+                            log::trace!("DNS over TCP query result: {name} -> {ips:?}");
+                            if let Ok(ips) = ips {
+                                let mut dns_cache = dns_cache.lock().await;
+                                for ip in ips {
+                                    dns_cache.insert(ip, name.clone());
                                 }
-                            } else {
-                                to_send.push_back(data);
                             }
                         }
                         Err(e) => {
-                            log::debug!("Failed to parse DNS message: {}", e);
-                            to_send.push_back(data);
+                            log::debug!("Failed to extract domain from DNS message: {}", e);
                         }
                     }
 
+                    if !ipv6_enabled {
+                        dns::remove_ipv6_entries(&mut message);
+                    }
+
+                    to_send.push_back(message.to_vec()?);
                     if len + 2 == buf.len() {
                         break;
                     }
