@@ -834,23 +834,43 @@ async fn handle_dns_over_tcp_session(
                     // remove the length field
                     let data = buf[2..len + 2].to_vec();
 
-                    let mut message = dns::parse_data_to_dns_message(&data, false)?;
+                    match dns::parse_data_to_dns_message(&data, false) {
+                        Ok(mut message) => {
+                            match dns::extract_domain_from_dns_message(&message) {
+                                Ok(name) => {
+                                    let ips = dns::extract_ipaddrs_from_dns_message(&message);
+                                    log::trace!("DNS over TCP query result: {name} -> {ips:?}");
+                                    if let Ok(ips) = ips {
+                                        let mut dns_cache = dns_cache.lock().await;
+                                        for ip in ips {
+                                            dns_cache.insert(ip, name.clone());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::debug!("Failed to extract domain from DNS message: {}", e);
+                                }
+                            }
 
-                    let name = dns::extract_domain_from_dns_message(&message)?;
-                    let ips = dns::extract_ipaddrs_from_dns_message(&message);
-                    log::trace!("DNS over TCP query result: {name} -> {ips:?}");
-                    if let Ok(ips) = ips {
-                        let mut dns_cache = dns_cache.lock().await;
-                        for ip in ips {
-                            dns_cache.insert(ip, name.clone());
+                            if !ipv6_enabled {
+                                dns::remove_ipv6_entries(&mut message);
+                                match message.to_vec() {
+                                    Ok(v) => to_send.push_back(v),
+                                    Err(e) => {
+                                        log::warn!("Failed to serialize DNS message: {}", e);
+                                        to_send.push_back(data);
+                                    }
+                                }
+                            } else {
+                                to_send.push_back(data);
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("Failed to parse DNS message: {}", e);
+                            to_send.push_back(data);
                         }
                     }
 
-                    if !ipv6_enabled {
-                        dns::remove_ipv6_entries(&mut message);
-                    }
-
-                    to_send.push_back(message.to_vec()?);
                     if len + 2 == buf.len() {
                         break;
                     }
