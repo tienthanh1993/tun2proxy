@@ -18,7 +18,7 @@ pub struct DnsCache {
 impl DnsCache {
     pub fn new() -> Self {
         Self {
-            lru_cache: LruCache::new_unbounded(),
+            lru_cache: LruCache::new(5000),
         }
     }
 

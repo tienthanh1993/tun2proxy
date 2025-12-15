@@ -82,7 +82,7 @@ pub fn extract_ipaddrs_from_dns_message(message: &Message) -> Result<Vec<IpAddr>
 pub fn extract_domain_from_dns_message(message: &Message) -> Result<String, String> {
     let query = message.queries().first().ok_or("DnsRequest no query body")?;
     let name = query.name().to_string();
-    Ok(name)
+    Ok(name.trim_end_matches('.').to_string())
 }
 
 pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Message, String> {
