@@ -29,11 +29,12 @@ impl DnsCache {
 
     pub fn lookup(&mut self, ip: &IpAddr) -> Option<String> {
         let now = Instant::now();
-        if let Some(entry) = self.lru_cache.get(ip) {
+        if let Some(entry) = self.lru_cache.get_mut(ip) {
             if now > entry.expiry {
                 self.lru_cache.remove(ip);
                 return None;
             }
+            entry.expiry = now + Duration::from_secs(MAPPING_TIMEOUT);
             return Some(entry.name.clone());
         }
         None
