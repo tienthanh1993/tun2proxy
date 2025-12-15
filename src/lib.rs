@@ -305,7 +305,7 @@ where
                     let mut info = info;
                     let mut use_no_proxy = false;
                     if let Some(domain) = &domain_name {
-                        if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port()).await {
+                        if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port(), dns_addr).await {
                             use_no_proxy = true;
                             info.dst = addr;
                         }
@@ -390,7 +390,7 @@ where
                     let mut info = info;
                     let mut use_no_proxy = false;
                     if let Some(domain) = &domain_name {
-                        if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port()).await {
+                        if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port(), dns_addr).await {
                             use_no_proxy = true;
                             info.dst = addr;
                         }
@@ -908,10 +908,32 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
     Ok(proxy_handler.get_udp_associate())
 }
 
-async fn resolve_domain_to_private_ip(domain: &str, port: u16) -> Option<SocketAddr> {
+async fn resolve_domain_to_private_ip(domain: &str, port: u16, dns_addr: IpAddr) -> Option<SocketAddr> {
     if let Ok(mut addrs) = tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
-        addrs.find(|a| is_private_ip(a.ip()))
-    } else {
-        None
+        if let Some(addr) = addrs.find(|a| is_private_ip(a.ip())) {
+            return Some(addr);
+        }
     }
+
+    let Ok(data) = dns::build_dns_query(domain) else {
+        return None;
+    };
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
+        return None;
+    };
+    let _ = socket.send_to(&data, SocketAddr::new(dns_addr, 53)).await;
+    let mut buf = [0_u8; 4096];
+    let Ok(Ok((len, _))) = tokio::time::timeout(std::time::Duration::from_secs(3), socket.recv_from(&mut buf)).await else {
+        return None;
+    };
+
+    let Ok(msg) = dns::parse_data_to_dns_message(&buf[..len], false) else {
+        return None;
+    };
+
+    if let Some(ip) = dns::extract_private_ip_from_dns_message(&msg) {
+        return Some(SocketAddr::new(ip, port));
+    }
+
+    None
 }
