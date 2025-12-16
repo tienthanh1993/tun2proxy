@@ -50,10 +50,29 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, Stri
     Err(format!("{:?}", message.answers()))
 }
 
+pub fn extract_ipaddrs_from_dns_message(message: &Message) -> Vec<IpAddr> {
+    if message.response_code() != ResponseCode::NoError {
+        return vec![];
+    }
+    let mut ip_addrs = Vec::new();
+    for answer in message.answers() {
+        match answer.data() {
+            RData::A(addr) => {
+                ip_addrs.push(IpAddr::V4((*addr).into()));
+            }
+            RData::AAAA(addr) => {
+                ip_addrs.push(IpAddr::V6((*addr).into()));
+            }
+            _ => {}
+        }
+    }
+    ip_addrs
+}
+
 pub fn extract_domain_from_dns_message(message: &Message) -> Result<String, String> {
     let query = message.queries().first().ok_or("DnsRequest no query body")?;
     let name = query.name().to_string();
-    Ok(name)
+    Ok(name.trim_end_matches('.').to_string())
 }
 
 pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> Result<Message, String> {
