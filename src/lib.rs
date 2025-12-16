@@ -9,7 +9,7 @@ use crate::{
 };
 pub use clap::ValueEnum;
 use dns_cache::DnsCache;
-use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
+use ipstack::{IpStackStream, IpStackUdpStream};
 use proxy_handler::{ProxyHandler, ProxyHandlerManager};
 use socks::SocksProxyManager;
 pub use socks5_impl::protocol::UserKey;
@@ -57,8 +57,10 @@ mod error;
 mod general_api;
 mod http;
 mod no_proxy;
+mod prefixed_stream;
 mod proxy_handler;
 mod session_info;
+mod sniff;
 pub mod socket_transfer;
 mod socks;
 mod traffic_status;
@@ -281,7 +283,7 @@ where
         };
         let max_sessions = args.max_sessions;
         match ip_stack_stream {
-            IpStackStream::Tcp(tcp) => {
+        IpStackStream::Tcp(mut tcp) => {
                 if task_count.load(Relaxed) >= max_sessions {
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
@@ -307,6 +309,24 @@ where
 
                 tokio::spawn(async move {
                     let mut info = info;
+
+                let mut buf = [0u8; 4096];
+                let (domain_name, prefix_len) = match tokio::time::timeout(std::time::Duration::from_millis(50), tcp.read(&mut buf)).await {
+                    Ok(Ok(len)) if len > 0 => {
+                        let data = &buf[..len];
+                        if let Some(host) = sniff::sniff_http_host(data) {
+                            (Some(host), len)
+                        } else if let Some(sni) = sniff::sniff_tls_sni(data) {
+                            (Some(sni), len)
+                        } else {
+                            (domain_name, len)
+                        }
+                    }
+                    _ => (domain_name, 0),
+                };
+
+                let tcp = prefixed_stream::PrefixedTcpStream::new(tcp, buf[..prefix_len].to_vec());
+
                     let mut use_no_proxy = false;
                     if let Some(domain) = &domain_name {
                         if let Some(addr) = resolve_domain_to_private_ip(domain, info.dst.port()).await {
@@ -503,11 +523,14 @@ where
     Ok(total)
 }
 
-async fn handle_tcp_session(
-    mut tcp_stack: IpStackTcpStream,
+async fn handle_tcp_session<T>(
+    mut tcp_stack: T,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
-) -> crate::Result<()> {
+) -> crate::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (session_info, server_addr) = {
         let handler = proxy_handler.lock().await;
 
