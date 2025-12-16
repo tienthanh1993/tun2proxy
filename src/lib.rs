@@ -800,7 +800,9 @@ async fn handle_dns_over_tcp_session(
                 }
                 let buf1 = &buf1[..len];
 
-                _ = dns::parse_data_to_dns_message(buf1, false)?;
+                if let Err(e) = dns::parse_data_to_dns_message(buf1, false) {
+                    log::debug!("Ignore invalid DNS message: {e}");
+                }
 
                 // Insert the DNS message length in front of the payload
                 let len = u16::try_from(buf1.len())?;
@@ -834,23 +836,28 @@ async fn handle_dns_over_tcp_session(
                     // remove the length field
                     let data = buf[2..len + 2].to_vec();
 
-                    let mut message = dns::parse_data_to_dns_message(&data, false)?;
+                    let packet = match dns::parse_data_to_dns_message(&data, false) {
+                        Ok(mut message) => {
+                            if let Ok(name) = dns::extract_domain_from_dns_message(&message) {
+                                let ips = dns::extract_ipaddrs_from_dns_message(&message);
+                                if !ips.is_empty() {
+                                    for ip in ips {
+                                        dns_cache.insert(ip, name.clone());
+                                    }
+                                }
+                                let ip = dns::extract_ipaddr_from_dns_message(&message);
+                                log::trace!("DNS over TCP query result: {name} -> {ip:?}");
+                            }
 
-                    let name = dns::extract_domain_from_dns_message(&message)?;
-                    let ips = dns::extract_ipaddrs_from_dns_message(&message);
-                    if !ips.is_empty() {
-                        for ip in ips {
-                            dns_cache.insert(ip, name.clone());
+                            if !ipv6_enabled {
+                                dns::remove_ipv6_entries(&mut message);
+                            }
+                            message.to_vec().unwrap_or(data)
                         }
-                    }
-                    let ip = dns::extract_ipaddr_from_dns_message(&message);
-                    log::trace!("DNS over TCP query result: {name} -> {ip:?}");
+                        Err(_e) => data,
+                    };
 
-                    if !ipv6_enabled {
-                        dns::remove_ipv6_entries(&mut message);
-                    }
-
-                    to_send.push_back(message.to_vec()?);
+                    to_send.push_back(packet);
                     if len + 2 == buf.len() {
                         break;
                     }
