@@ -225,6 +225,8 @@ where
     #[cfg(not(target_os = "linux"))]
     let socket_queue = None;
 
+    let dns_cache = Arc::new(Mutex::new(crate::dns_cache::DnsCache::new()));
+
     use socks5_impl::protocol::Version::{V4, V5};
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
     let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
@@ -350,6 +352,7 @@ where
                         info.protocol = IpProtocol::Tcp;
                         let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
                         let socket_queue = socket_queue.clone();
+                        let dns_cache = dns_cache.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
                                 log::error!("{info} error \"{err}\"");
@@ -385,6 +388,7 @@ where
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 let socket_queue = socket_queue.clone();
                 let task_count = task_count.clone();
+                let dns_cache = dns_cache.clone();
                 let proxy_type = args.proxy.proxy_type;
 
                 tokio::spawn(async move {
@@ -412,7 +416,7 @@ where
                                         Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
                                         None => dst.into(),
                                     };
-                                    if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, socket_queue, ipv6_enabled).await {
+                                    if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
                                         log::info!("Ending {info} with \"{e}\"");
                                     }
                                 }
