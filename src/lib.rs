@@ -8,6 +8,7 @@ use crate::{
     virtual_dns::VirtualDns,
 };
 pub use clap::ValueEnum;
+use dns_cache::DnsCache;
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use proxy_handler::{ProxyHandler, ProxyHandlerManager};
 use socks::SocksProxyManager;
@@ -50,6 +51,7 @@ mod android;
 mod args;
 mod directions;
 mod dns;
+mod dns_cache;
 mod dump_logger;
 mod error;
 mod general_api;
@@ -174,6 +176,8 @@ where
         None
     };
 
+    let dns_cache = Arc::new(DnsCache::new(std::time::Duration::from_secs(120)));
+
     #[cfg(target_os = "linux")]
     let socket_queue = match args.socket_transfer_fd {
         None => None,
@@ -293,7 +297,7 @@ where
                     virtual_dns.touch_ip(&tcp.peer_addr().ip());
                     virtual_dns.resolve_ip(&tcp.peer_addr().ip()).cloned()
                 } else {
-                    None
+                    dns_cache.get(&tcp.peer_addr().ip())
                 };
 
                 let mgr = mgr.clone();
@@ -349,8 +353,9 @@ where
                         info.protocol = IpProtocol::Tcp;
                         let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
                         let socket_queue = socket_queue.clone();
+                        let dns_cache = dns_cache.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled).await {
+                            if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled, dns_cache).await {
                                 log::error!("{info} error \"{err}\"");
                             }
                             log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
@@ -375,7 +380,7 @@ where
                     virtual_dns.touch_ip(&udp.peer_addr().ip());
                     virtual_dns.resolve_ip(&udp.peer_addr().ip()).cloned()
                 } else {
-                    None
+                    dns_cache.get(&udp.peer_addr().ip())
                 };
 
                 #[cfg(feature = "udpgw")]
@@ -770,6 +775,7 @@ async fn handle_dns_over_tcp_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_cache: Arc<DnsCache>,
 ) -> crate::Result<()> {
     let (session_info, server_addr) = {
         let handler = proxy_handler.lock().await;
@@ -831,6 +837,12 @@ async fn handle_dns_over_tcp_session(
                     let mut message = dns::parse_data_to_dns_message(&data, false)?;
 
                     let name = dns::extract_domain_from_dns_message(&message)?;
+                    let ips = dns::extract_ipaddrs_from_dns_message(&message);
+                    if !ips.is_empty() {
+                        for ip in ips {
+                            dns_cache.insert(ip, name.clone());
+                        }
+                    }
                     let ip = dns::extract_ipaddr_from_dns_message(&message);
                     log::trace!("DNS over TCP query result: {name} -> {ip:?}");
 
