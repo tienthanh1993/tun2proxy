@@ -46,6 +46,6 @@ impl DnsCache {
              }
         }
 
-        None
+        Some(ip.to_string())
     }
 }
