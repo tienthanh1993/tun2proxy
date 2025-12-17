@@ -297,7 +297,16 @@ where
                     virtual_dns.touch_ip(&tcp.peer_addr().ip());
                     virtual_dns.resolve_ip(&tcp.peer_addr().ip()).cloned()
                 } else {
-                    dns_cache.get(&tcp.peer_addr().ip())
+                    match dns_cache.get(&tcp.peer_addr().ip()) {
+                        None => {
+                            log::debug!(
+                                "Could not get domain from dns cache for {}, proxying by IP",
+                                tcp.peer_addr().ip()
+                            );
+                            None
+                        }
+                        Some(domain) => Some(domain),
+                    }
                 };
 
                 let mgr = mgr.clone();
