@@ -29,7 +29,7 @@ impl DnsCache {
         if let Some((_, expiry)) = cache.get(ip) {
             if *expiry < Instant::now() {
                 cache.remove(ip);
-                return None;
+                return Some(ip.to_string());
             }
         }
 

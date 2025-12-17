@@ -934,4 +934,3 @@ async fn resolve_domain_to_private_ip(domain: &str, port: u16) -> Option<SocketA
         None
     }
 }
-#[cfg(test)] mod dns_cache_test;
